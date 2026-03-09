@@ -3,3 +3,4 @@ from .dynamic_rnn import DynamicGRU
 from .mutihead_attention import MultiheadAttention
 from .tanh_attention import TanhAttention
 from .net_vlad import NetVLAD
+from .query_guided_moe import QueryGuidedMoE, QueryGuidedMoESimple
