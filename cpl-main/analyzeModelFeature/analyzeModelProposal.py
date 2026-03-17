@@ -1,120 +1,401 @@
+# noinspection PyUnresolvedReferences,PyPackageRequirements
+# 必须在导入项目模块之前把 cpl-main 根目录加入 sys.path。你要是再敢动我的代码我他妈给你删了
+import os
+import sys
+import argparse
+import json
+import random
+from datetime import datetime
+import numpy as np
 import torch
 import torch.nn.functional as F
-import json
-import numpy as np
 from tqdm import tqdm
-import os
 
-def analyze_model_predictions(model, dataloader, device, output_file="error_analysis.json"):
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+from runners import MainRunner
+from utils import load_json
+
+
+def _to_python_scalar(x):
+    if isinstance(x, torch.Tensor):
+        if x.numel() == 1:
+            return x.item()
+        return x.detach().cpu().numpy().tolist()
+    if isinstance(x, np.generic):
+        return x.item()
+    return x
+
+
+def _to_python_list(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy().tolist()
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    return x
+
+
+def _iou_1d(gt_start, gt_end, pred_start, pred_end):
+    inter_start = max(gt_start, pred_start)
+    inter_end = min(gt_end, pred_end)
+    inter_len = max(0.0, inter_end - inter_start)
+    union_len = (pred_end - pred_start) + (gt_end - gt_start) - inter_len
+    return inter_len / union_len if union_len > 0 else 0.0
+
+
+def analyze_model_predictions(
+    model,
+    dataloader,
+    device,
+    output_file="proposal_analysis.json",
+    split_name="eval",
+    iou_thresholds=(0.3, 0.5, 0.7),
+    epoch_for_inference=100,
+    dataset_name="ActivityNet",
+):
     """
-    运行推理，记录每个视频的 Top-5 预测区间和得分，分析 Rank1 掉点的具体原因。
+    在验证/测试集上运行一次推理，记录每个样本的全部 num_props 提议与 GT 区间。
+    同时给出 Rank@1 与 Rank@5 的诊断统计，用于分析 Rank1 大幅下降但 Rank5 提升的现象。
+
+    参数:
+        model: 训练好的模型
+        dataloader: 验证/测试 dataloader
+        device: 设备, 如 "cuda" 或 torch.device("cuda")
+        output_file: 输出 JSON 文件路径
+        split_name: 数据划分名, 如 "val" / "test"
+        iou_thresholds: 评估 IoU 阈值
+        epoch_for_inference: 透传给 model.forward 的 epoch 参数(用于兼容现有训练逻辑)
+        dataset_name: 数据集名称
     """
+    from models.loss import cal_nll_loss
+
     model.eval()
     analysis_results = []
 
-    # 统计指标
+    # 统计指标（重点对比 Rank1 与 Rank5）
+    total_samples = 0
     rank1_shorter_than_gt = 0
     rank1_longer_than_gt = 0
-    
+    rank1_center_outside_gt = 0
+
+    metrics = {
+        f"r@1_iou{thr}": 0 for thr in iou_thresholds
+    }
+    metrics.update({
+        f"r@5_iou{thr}": 0 for thr in iou_thresholds
+    })
+
     with torch.no_grad():
         for batch_idx, batch_data in enumerate(tqdm(dataloader, desc="Analyzing Predictions")):
-            # 这里假设你的 dataloader 返回的数据字典格式如下，请根据实际情况微调
-            frames_feat = batch_data['frames_feat'].to(device)
-            frames_len = batch_data['frames_len'].to(device)
-            words_id = batch_data['words_id'].to(device)
-            words_feat = batch_data['words_feat'].to(device)
-            words_len = batch_data['words_len'].to(device)
-            weights = batch_data['weights'].to(device)
-            
-            vid_names = batch_data['vid_name'] # 视频ID
-            gt_windows = batch_data['gt_window'] # 真实的 [start, end]
-            video_durations = batch_data['duration'] # 视频总时长
-            
+            net_input = batch_data['net_input']
+            frames_feat = net_input['frames_feat'].to(device)
+            frames_len = net_input['frames_len'].to(device)
+            words_id = net_input['words_id'].to(device)
+            words_feat = net_input['words_feat'].to(device)
+            words_len = net_input['words_len'].to(device)
+            weights = net_input['weights'].to(device)
+
+            # [vid, duration, [gt_start, gt_end], sentence]
+            raw_items = batch_data['raw']
+
             bsz = frames_feat.shape[0]
 
-            # 1. 前向传播获取预测结果
-            outputs = model(frames_feat=frames_feat, frames_len=frames_len, 
-                            words_id=words_id, words_feat=words_feat, 
-                            words_len=words_len, weights=weights, epoch=100) # epoch参数用于绕过负样本挖掘逻辑
+            outputs = model(
+                frames_feat=frames_feat,
+                frames_len=frames_len,
+                words_id=words_id,
+                words_feat=words_feat,
+                words_len=words_len,
+                weights=weights,
+                epoch=epoch_for_inference,
+            )
 
-            words_logit = outputs['words_logit'] # [bsz * num_props, seq_len, vocab_size]
-            center = outputs['center']           # [bsz * num_props]
-            width = outputs['width']             # [bsz * num_props]
-            
-            # 2. 计算每个 Proposal 的得分 (通常是重构 Query 的似然度)
-            # words_id 扩展到对应的维度: [bsz * num_props, seq_len]
-            words_id_expanded = words_id.unsqueeze(1).expand(bsz, model.num_props, -1).contiguous().view(bsz * model.num_props, -1)
-            
-            # 计算 log probability
-            log_probs = F.log_softmax(words_logit, dim=-1)
-            
-            # 取出真实单词对应的 log_prob 并求和作为该 proposal 的得分
-            # 这里为了简单，我们计算所有非 padding 词的 log_prob 之和
-            mask = (words_id_expanded != 0).float()
-            gather_log_probs = torch.gather(log_probs, 2, words_id_expanded.unsqueeze(2)).squeeze(2)
-            proposal_scores = (gather_log_probs * mask).sum(dim=1) # [bsz * num_props]
-            
-            proposal_scores = proposal_scores.view(bsz, model.num_props)
+            words_logit = outputs['words_logit']
+            center = outputs['center']
+            width = outputs['width']
+            words_mask = outputs['words_mask']
+
+            # 计算每个 proposal 的 nll_loss（与 main_runner.py 中的 eval 方法一致）
+            words_mask_expanded = words_mask.unsqueeze(1) \
+                .expand(bsz, model.num_props, -1).contiguous().view(bsz * model.num_props, -1)
+            words_id_expanded = words_id.unsqueeze(1) \
+                .expand(bsz, model.num_props, -1).contiguous().view(bsz * model.num_props, -1)
+
+            nll_loss, acc = cal_nll_loss(
+                words_logit, words_id_expanded, words_mask_expanded)
+            nll_loss = nll_loss.view(bsz, model.num_props)
+
             centers = center.view(bsz, model.num_props)
             widths = width.view(bsz, model.num_props)
 
-            # 3. 对每个 Batch 的样本进行单独分析
             for i in range(bsz):
-                scores_i = proposal_scores[i]
+                nll_losses_i = nll_loss[i]
                 centers_i = centers[i]
                 widths_i = widths[i]
-                
-                # 按得分排序，获取 Top-5
-                top_scores, top_indices = torch.topk(scores_i, k=5, largest=True)
-                
-                top5_preds = []
-                duration = float(video_durations[i])
-                gt_start, gt_end = float(gt_windows[i][0]), float(gt_windows[i][1])
+
+                vid_name = raw_items[i][0]
+                duration = float(_to_python_scalar(raw_items[i][1]))
+                gt_window_i = _to_python_list(raw_items[i][2])
+                gt_start, gt_end = float(gt_window_i[0]), float(gt_window_i[1])
                 gt_len = gt_end - gt_start
+
+                # 计算标准化交叉熵损失：nll_loss * width（标准化长度）
+                normalized_nll_loss = nll_losses_i * widths_i
                 
-                for rank, idx in enumerate(top_indices):
-                    c = centers_i[idx].item() * duration
-                    w = widths_i[idx].item() * duration
+                # 全部 num_props 提议（按标准化 nll_loss 从小到大排序）
+                sorted_normalized_nll_losses, sorted_indices = torch.sort(
+                    normalized_nll_loss, descending=False)
+                sample_props = []
+
+                for rank, idx_tensor in enumerate(sorted_indices):
+                    idx = int(idx_tensor.item())
+                    c_norm = float(centers_i[idx].item())
+                    w_norm = float(widths_i[idx].item())
+                    nll_loss_val = float(nll_losses_i[idx].item())
+                    normalized_nll_loss_val = float(normalized_nll_loss[idx].item())
+
+                    c = c_norm * duration
+                    w = w_norm * duration
                     pred_start = max(0.0, c - w / 2)
                     pred_end = min(duration, c + w / 2)
-                    
-                    # 计算 IoU
-                    inter_start = max(gt_start, pred_start)
-                    inter_end = min(gt_end, pred_end)
-                    inter_len = max(0.0, inter_end - inter_start)
-                    union_len = (pred_end - pred_start) + (gt_end - gt_start) - inter_len
-                    iou = inter_len / union_len if union_len > 0 else 0.0
-                    
-                    top5_preds.append({
+
+                    iou = _iou_1d(gt_start, gt_end, pred_start, pred_end)
+
+                    pred_length = pred_end - pred_start
+                    pred_length_norm = pred_length / duration if duration > 0 else 0.0
+
+                    sample_props.append({
+                        "proposal_index": idx,
                         "rank": rank + 1,
-                        "score": float(top_scores[rank].item()),
+                        "nll_loss": nll_loss_val,
+                        "normalized_nll_loss": normalized_nll_loss_val,
+                        "center_norm": c_norm,
+                        "width_norm": w_norm,
                         "pred_window": [pred_start, pred_end],
+                        "pred_length": pred_length,
+                        "pred_length_norm": pred_length_norm,
                         "iou": iou
                     })
-                
-                # 分析 Rank1 错在哪
-                rank1_pred = top5_preds[0]['pred_window']
+
+                top1 = sample_props[0]
+                top5 = sample_props[:5]
+                top1_iou = top1['iou']
+                top5_best_iou = max([p['iou']
+                                    for p in top5]) if len(top5) > 0 else 0.0
+
+                for thr in iou_thresholds:
+                    if top1_iou >= thr:
+                        metrics[f"r@1_iou{thr}"] += 1
+                    if top5_best_iou >= thr:
+                        metrics[f"r@5_iou{thr}"] += 1
+
+                rank1_pred = top1['pred_window']
                 rank1_len = rank1_pred[1] - rank1_pred[0]
                 if rank1_len < gt_len * 0.5:
                     rank1_shorter_than_gt += 1
                 elif rank1_len > gt_len * 1.5:
                     rank1_longer_than_gt += 1
 
+                rank1_center = (rank1_pred[0] + rank1_pred[1]) / 2.0
+                if not (gt_start <= rank1_center <= gt_end):
+                    rank1_center_outside_gt += 1
+
+                total_samples += 1
+
                 analysis_results.append({
-                    "vid_name": vid_names[i],
+                    "vid_name": str(_to_python_scalar(vid_name)),
+                    "split": split_name,
+                    "batch_idx": int(batch_idx),
+                    "sample_idx_in_batch": int(i),
                     "duration": duration,
                     "gt_window": [gt_start, gt_end],
-                    "top5_predictions": top5_preds,
-                    "score_margin_1_vs_2": top5_preds[0]['score'] - top5_preds[1]['score'] # 记录Top1和Top2的分差
+                    "num_props": int(model.num_props),
+                    "top1_iou": top1_iou,
+                    "top5_best_iou": top5_best_iou,
+                    "nll_loss_margin_1_vs_2": (
+                        sample_props[0]['nll_loss'] -
+                        sample_props[1]['nll_loss']
+                        if len(sample_props) > 1 else None
+                    ),
+                    "proposals": sample_props,
                 })
 
-    # 保存结果
-    with open(output_file, 'w') as f:
-        json.append(analysis_results, f, indent=4)
-    
+    # 归一化统计
+    if total_samples > 0:
+        summary_metrics = {
+            k: v / total_samples for k, v in metrics.items()
+        }
+        summary = {
+            "num_samples": total_samples,
+            "rank1_shorter_than_gt_ratio": rank1_shorter_than_gt / total_samples,
+            "rank1_longer_than_gt_ratio": rank1_longer_than_gt / total_samples,
+            "rank1_center_outside_gt_ratio": rank1_center_outside_gt / total_samples,
+            "metrics": summary_metrics,
+        }
+    else:
+        summary = {
+            "num_samples": 0,
+            "rank1_shorter_than_gt_ratio": 0.0,
+            "rank1_longer_than_gt_ratio": 0.0,
+            "rank1_center_outside_gt_ratio": 0.0,
+            "metrics": {k: 0.0 for k in metrics.keys()},
+        }
+
+    result_package = {
+        "meta": {
+            "created_at": datetime.now().isoformat(),
+            "split": split_name,
+            "num_props": int(getattr(model, 'num_props', -1)),
+            "output_file": os.path.abspath(output_file),
+            "description": "Each sample contains all proposals from one forward inference and IoU against GT.",
+        },
+        "summary": summary,
+        "samples": analysis_results,
+    }
+
+    output_dir = os.path.dirname(os.path.abspath(output_file))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(result_package, f, ensure_ascii=False, indent=2)
+
     print(f"Analysis complete. Results saved to {output_file}")
-    print(f"Stats: Rank1 is much shorter than GT in {rank1_shorter_than_gt} cases.")
-    print(f"Stats: Rank1 is much longer than GT in {rank1_longer_than_gt} cases.")
+    print(f"Num samples: {summary['num_samples']}")
+    print(
+        f"Rank1 shorter-than-GT ratio: {summary['rank1_shorter_than_gt_ratio']:.4f}")
+    print(
+        f"Rank1 longer-than-GT ratio: {summary['rank1_longer_than_gt_ratio']:.4f}")
+    print(
+        f"Rank1 center-outside-GT ratio: {summary['rank1_center_outside_gt_ratio']:.4f}")
+    for thr in iou_thresholds:
+        print(f"R@1 IoU={thr}: {summary['metrics'][f'r@1_iou{thr}']:.4f}")
+        print(f"R@5 IoU={thr}: {summary['metrics'][f'r@5_iou{thr}']:.4f}")
+
+    return result_package
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run proposal-level inference analysis for CPL/CPL-MoE.")
+    parser.add_argument('--config-path', type=str,
+                        required=True, help='Path to config json')
+    parser.add_argument('--model-path', type=str,
+                        required=True, help='Path to checkpoint .pt')
+    parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'],
+                        help='Dataset split for analysis')
+    parser.add_argument('--output-file', type=str, default='analysis/proposal_analysis.json',
+                        help='Output json file path')
+    parser.add_argument('--seed', type=int, default=8, help='Random seed')
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='Override batch size from config')
+    parser.add_argument('--epoch-for-inference', type=int, default=100,
+                        help='Epoch value passed into model forward')
+    parser.add_argument('--iou-thresholds', type=float, nargs='+', default=[0.3, 0.5, 0.7],
+                        help='IoU thresholds used in summary metrics')
+    return parser.parse_args()
+
+
+def build_runner_from_args(args):
+    config = load_json(args.config_path)
+
+    # 将配置中的相对路径转换为绝对路径（相对于项目根目录）
+    dataset_config = config['dataset']
+
+    # 处理数据和词汇表路径
+    for key in ['train_data', 'test_data', 'val_data', 'vocab_path', 'feature_path']:
+        if key in dataset_config:
+            dataset_config[key] = _resolve_path(
+                dataset_config[key], PROJECT_ROOT)
+
+    if args.batch_size is not None:
+        config['train']['batch_size'] = int(args.batch_size)
+
+    seed = args.seed
+    random.seed(seed)
+    np.random.seed(seed + 1)
+    torch.manual_seed(seed + 2)
+    torch.cuda.manual_seed(seed + 4)
+    torch.cuda.manual_seed_all(seed + 4)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    runner = MainRunner(config)
+    runner._load_model(args.model_path)
+    return runner
+
+
+def select_dataloader(runner, split):
+    if split == 'train':
+        return runner.train_loader
+    if split == 'val':
+        if runner.val_loader is None:
+            raise ValueError(
+                'val split requested but val_loader is None. Check config[dataset][val_data].')
+        return runner.val_loader
+    return runner.test_loader
+
+
+def _resolve_path(raw, base_dir):
+    """若 raw 是相对路径，则拼接到 base_dir 下；若是绝对路径则原样返回。"""
+    if os.path.isabs(raw):
+        return raw
+    return os.path.join(base_dir, raw)
+
+
+def main():
+    args = parse_args()
+
+    # 相对路径自动补全：config/ checkpoints/ analyzeModelFeature/
+    args.config_path = _resolve_path(args.config_path,
+                                     os.path.join(PROJECT_ROOT, 'config'))
+    args.model_path = _resolve_path(args.model_path,
+                                    os.path.join(PROJECT_ROOT, 'checkpoints'))
+    args.output_file = _resolve_path(args.output_file,
+                                     os.path.join(PROJECT_ROOT, 'analyzeModelFeature'))
+
+    if not os.path.exists(args.config_path):
+        raise FileNotFoundError(f'Config file not found: {args.config_path}')
+    if not os.path.exists(args.model_path):
+        raise FileNotFoundError(
+            f'Model checkpoint not found: {args.model_path}')
+
+    runner = build_runner_from_args(args)
+
+    # 根据数据集类型确定 IoU 阈值
+    config = load_json(args.config_path)
+    dataset_name = config['dataset'].get('dataset', 'ActivityNet')
+
+    if dataset_name == 'CharadesSTA':
+        iou_thresholds = (0.3, 0.5, 0.7)
+    else:  # ActivityNet
+        iou_thresholds = (0.1, 0.3, 0.5)
+
+    dataloader = select_dataloader(runner, args.split)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    runner.model = runner.model.to(device)
+
+    analyze_model_predictions(
+        model=runner.model,
+        dataloader=dataloader,
+        device=device,
+        output_file=args.output_file,
+        split_name=args.split,
+        iou_thresholds=iou_thresholds,
+        epoch_for_inference=args.epoch_for_inference,
+        dataset_name=dataset_name,
+    )
 
 # 调用示例 (你需要根据你的实际启动脚本调整传入的变量):
-# analyze_model_predictions(model, test_loader, device='cuda')
+# analyze_model_predictions(model, val_loader, device='cuda', output_file='analysis/val_proposals.json', split_name='val')
+# analyze_model_predictions(model, test_loader, device='cuda', output_file='analysis/test_proposals.json', split_name='test')
+
+
+if __name__ == '__main__':
+    main()
+
+'''
+python analyzeModelProposal.py --config-path activitynet/main_moe.json --model-path activitynet_moe/cpl_moe/model-best.pt --output-file AncPropInfo.json
+'''

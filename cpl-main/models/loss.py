@@ -21,6 +21,39 @@ def cal_nll_loss(logit, idx, mask, weights=None):
     return nll_loss.contiguous(), mean_acc
 
 
+def cal_nll_loss_with_width(logit, idx, mask, width, weights=None):
+    """
+    计算交叉熵损失，并返回标准化长度信息用于后续排序
+    
+    参数:
+        logit: 模型输出的logit
+        idx: 目标词索引
+        mask: 掩码
+        width: 提议的宽度（已归一化到[0,1]）
+        weights: 可选的权重
+    
+    返回:
+        nll_loss: 交叉熵损失
+        mean_acc: 准确率
+        width: 标准化长度（即宽度）
+    """
+    eps = 0.1
+    acc = (logit.max(dim=-1)[1]==idx).float()
+    mean_acc = (acc * mask).sum() / mask.sum()
+    
+    logit = logit.log_softmax(dim=-1)
+    nll_loss = -logit.gather(dim=-1, index=idx.unsqueeze(-1)).squeeze(-1)
+    smooth_loss = -logit.sum(dim=-1)
+    nll_loss = (1 - eps) * nll_loss + eps / logit.size(-1) * smooth_loss
+    if weights is None:
+        nll_loss = nll_loss.masked_fill(mask == 0, 0)
+        nll_loss = nll_loss.sum(dim=-1) / mask.sum(dim=-1)
+    else:
+        nll_loss = (nll_loss * weights).sum(dim=-1)
+
+    return nll_loss.contiguous(), mean_acc, width
+
+
 def rec_loss(words_logit, words_id, words_mask, num_props, ref_words_logit=None, **kwargs):
     bsz = words_logit.size(0) // num_props
     words_mask1 = words_mask.unsqueeze(1) \
