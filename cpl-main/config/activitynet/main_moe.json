@@ -1,7 +1,7 @@
 {
   "dataset": {
     "dataset": "ActivityNet",
-    "feature_path": "/data/chenyuan/videogrounding/cpl-main/data/activitynet/c3d_features.hdf5",
+    "feature_path": "/data/chenyuan/videogrounding/cpl-main/data/activitynet/sub_activitynet_v1-3.c3d.hdf5",
     "vocab_size": 1111,
     "word_dim": 300,
     "frame_dim": 500,
@@ -57,7 +57,7 @@
   "loss": {
     "margin_1": 0.1,
     "margin_2": 0.2,
-    "lambda": 0.2,
+    "lambda": 0.127,
     "alpha_1": 1,
     "alpha_2": 5
   }

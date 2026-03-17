@@ -5,6 +5,7 @@ from torch.utils.data import Dataset
 from utils import load_json
 import nltk
 
+
 class BaseDataset(Dataset):
     def __init__(self, data_path, vocab, args, **kwargs):
         self.vocab = vocab
@@ -51,7 +52,7 @@ class BaseDataset(Dataset):
         vid, duration, timestamps, sentence = self.data[index]
         duration = float(duration)
 
-        weights = [] # Probabilities to be masked
+        weights = []  # Probabilities to be masked
         words = []
         for word, tag in nltk.pos_tag(nltk.tokenize.word_tokenize(sentence)):
             word = word.lower()
@@ -65,11 +66,27 @@ class BaseDataset(Dataset):
                 else:
                     weights.append(1)
                 words.append(word)
+
+        # Handle empty words list
+        if len(words) == 0:
+            # Use a default token or skip this sample
+            # For now, we'll use the first word in vocab as placeholder
+            default_word = list(self.keep_vocab.keys())[
+                0] if self.keep_vocab else None
+            if default_word is None:
+                raise ValueError(
+                    f"Empty vocabulary and empty words for sample {index}: {sentence}")
+            words = [default_word]
+            weights = [1]
+
         words_id = [self.keep_vocab[w] for w in words]
-        words_feat = [self.vocab['id2vec'][self.vocab['w2id'][words[0]]].astype(np.float32)] # placeholder for the start token
-        words_feat.extend([self.vocab['id2vec'][self.vocab['w2id'][w]].astype(np.float32) for w in words])
-        frames_feat = self._sample_frame_features(self._load_frame_features(vid))
-        
+        words_feat = [self.vocab['id2vec'][self.vocab['w2id'][words[0]]].astype(
+            np.float32)]  # placeholder for the start token
+        words_feat.extend(
+            [self.vocab['id2vec'][self.vocab['w2id'][w]].astype(np.float32) for w in words])
+        frames_feat = self._sample_frame_features(
+            self._load_frame_features(vid))
+
         return {
             'frames_feat': frames_feat,
             'words_feat': words_feat,
@@ -93,8 +110,10 @@ def build_collate_data(max_num_frames, max_num_words, frame_dim, word_dim):
             frames_len.append(min(len(sample['frames_feat']), max_num_frames))
             words_len.append(min(len(sample['words_id']), max_num_words))
 
-        frames_feat = np.zeros([bsz, max_num_frames, frame_dim]).astype(np.float32)
-        words_feat = np.zeros([bsz, max(words_len) + 1, word_dim]).astype(np.float32)
+        frames_feat = np.zeros(
+            [bsz, max_num_frames, frame_dim]).astype(np.float32)
+        words_feat = np.zeros(
+            [bsz, max(words_len) + 1, word_dim]).astype(np.float32)
         words_id = np.zeros([bsz, max(words_len)]).astype(np.int64)
         weights = np.zeros([bsz, max(words_len)]).astype(np.float32)
         for i, sample in enumerate(samples):
