@@ -78,6 +78,10 @@ def analyze_model_predictions(
     rank1_shorter_than_gt = 0
     rank1_longer_than_gt = 0
     rank1_center_outside_gt = 0
+    rank1_not_best_iou = 0
+    rank5_has_best_iou = 0
+    best_iou_rank_counts = {i: 0 for i in range(1, 9)} # 记录最好IoU出现在Rank 1~8的次数
+    rank_norm_lengths = {i: [] for i in range(1, 9)} # 记录Rank 1~8的提议的归一化长度
 
     metrics = {
         f"r@1_iou{thr}": 0 for thr in iou_thresholds
@@ -178,6 +182,10 @@ def analyze_model_predictions(
                         "iou": iou
                     })
 
+                    # 记录Rank 1~8的标准化长度
+                    if rank + 1 <= 8:
+                        rank_norm_lengths[rank + 1].append(pred_length_norm)
+
                 top1 = sample_props[0]
                 top5 = sample_props[:5]
                 top1_iou = top1['iou']
@@ -200,6 +208,26 @@ def analyze_model_predictions(
                 rank1_center = (rank1_pred[0] + rank1_pred[1]) / 2.0
                 if not (gt_start <= rank1_center <= gt_end):
                     rank1_center_outside_gt += 1
+
+                # 寻找全局(或所有proposal中)最佳的IoU及对应的Rank
+                best_iou = -1.0
+                best_rank = -1
+                for p in sample_props:
+                    if p['iou'] > best_iou:
+                        best_iou = p['iou']
+                        best_rank = p['rank']
+                
+                # Rank 1 不是最佳IoU的比例
+                if best_rank != 1:
+                    rank1_not_best_iou += 1
+                
+                # 最佳IoU落在前5的比例
+                if 1 <= best_rank <= 5:
+                    rank5_has_best_iou += 1
+                
+                # 统计最高IoU落在哪一个Rank(1~8)
+                if 1 <= best_rank <= 8:
+                    best_iou_rank_counts[best_rank] += 1
 
                 total_samples += 1
 
@@ -226,11 +254,19 @@ def analyze_model_predictions(
         summary_metrics = {
             k: v / total_samples for k, v in metrics.items()
         }
+        avg_rank_norm_lengths = {
+            f"rank{k}": float(np.mean(lengths)) if len(lengths) > 0 else 0.0
+            for k, lengths in rank_norm_lengths.items()
+        }
         summary = {
             "num_samples": total_samples,
             "rank1_shorter_than_gt_ratio": rank1_shorter_than_gt / total_samples,
             "rank1_longer_than_gt_ratio": rank1_longer_than_gt / total_samples,
             "rank1_center_outside_gt_ratio": rank1_center_outside_gt / total_samples,
+            "rank1_not_best_iou_ratio": rank1_not_best_iou / total_samples,
+            "rank5_has_best_iou_ratio": rank5_has_best_iou / total_samples,
+            "best_iou_in_rank_distribution": {f"rank{k}": v / total_samples for k, v in best_iou_rank_counts.items()},
+            "avg_rank_norm_lengths": avg_rank_norm_lengths,
             "metrics": summary_metrics,
         }
     else:
@@ -239,6 +275,10 @@ def analyze_model_predictions(
             "rank1_shorter_than_gt_ratio": 0.0,
             "rank1_longer_than_gt_ratio": 0.0,
             "rank1_center_outside_gt_ratio": 0.0,
+            "rank1_not_best_iou_ratio": 0.0,
+            "rank5_has_best_iou_ratio": 0.0,
+            "best_iou_in_rank_distribution": {f"rank{k}": 0.0 for k in range(1, 9)},
+            "avg_rank_norm_lengths": {f"rank{k}": 0.0 for k in range(1, 9)},
             "metrics": {k: 0.0 for k in metrics.keys()},
         }
 
@@ -269,6 +309,17 @@ def analyze_model_predictions(
         f"Rank1 longer-than-GT ratio: {summary['rank1_longer_than_gt_ratio']:.4f}")
     print(
         f"Rank1 center-outside-GT ratio: {summary['rank1_center_outside_gt_ratio']:.4f}")
+    print(
+        f"Rank1 not best IoU ratio: {summary['rank1_not_best_iou_ratio']:.4f}")
+    print(
+        f"Rank5 has best IoU ratio: {summary['rank5_has_best_iou_ratio']:.4f}")
+    print("Best IoU Rank Distribution:")
+    for k, v in summary['best_iou_in_rank_distribution'].items():
+        print(f"  {k}: {v:.4f}")
+    print("Average Standardized Proposal Length per Rank (Rank 1~8):")
+    for k, v in summary['avg_rank_norm_lengths'].items():
+        print(f"  {k}: {v:.4f}")
+
     for thr in iou_thresholds:
         print(f"R@1 IoU={thr}: {summary['metrics'][f'r@1_iou{thr}']:.4f}")
         print(f"R@5 IoU={thr}: {summary['metrics'][f'r@5_iou{thr}']:.4f}")
