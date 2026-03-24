@@ -102,6 +102,16 @@ def ivc_loss(words_logit, words_id, words_mask, num_props, neg_words_logit_1=Non
         rank_loss = ref_loss.mean()
     else:
         rank_loss = min_nll_loss.mean()
+
+    width_tensor = kwargs.get('width')
+    use_width_reg = kwargs.get('use_width_reg', False)
+    width_lambda = kwargs.get('width_lambda', 0.0)
+    width_loss = words_logit.new_tensor(0.0)
+    if use_width_reg and width_tensor is not None:
+        width_tensor = width_tensor.view(bsz, num_props)
+        selected_width = width_tensor.gather(index=idx.unsqueeze(-1), dim=-1).squeeze(-1)
+        width_loss = selected_width.mean()
+        # width_loss = torch.clamp(selected_width - 0.05, min=0).mean()  # Margin guard for width collapse.
     
     if neg_words_logit_1 is not None:
         neg_nll_loss_1, neg_acc_1 = cal_nll_loss(neg_words_logit_1, words_id1, words_mask1)
@@ -128,11 +138,14 @@ def ivc_loss(words_logit, words_id, words_mask, num_props, neg_words_logit_1=Non
     div_loss = torch.norm(target - source, dim=(1, 2))**2
 
     loss = loss + kwargs['alpha_2'] * div_loss.mean()
+    width_penalty = width_lambda * width_loss
+    loss = loss + width_penalty
 
     return loss, {
         'ivc_loss': loss.item(),
         'neg_loss_1': neg_loss_1.mean().item() if neg_words_logit_1 is not None else 0.0,
         'neg_loss_2': neg_loss_2.mean().item() if neg_words_logit_2 is not None else 0.0,
         'ref_loss': ref_loss.mean().item() if ref_words_logit is not None else 0.0,
-        'div_loss': div_loss.mean().item()
+        'div_loss': div_loss.mean().item(),
+        'width_loss': width_penalty.item()
     }
