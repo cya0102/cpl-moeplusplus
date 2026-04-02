@@ -54,6 +54,8 @@ class BaseDataset(Dataset):
 
         weights = []  # Probabilities to be masked
         words = []
+        static_mask = []  # True = 静态词 (名词/形容词)
+        motion_mask = []  # True = 运动词 (动词/副词)
         for word, tag in nltk.pos_tag(nltk.tokenize.word_tokenize(sentence)):
             word = word.lower()
             if word in self.keep_vocab:
@@ -66,6 +68,8 @@ class BaseDataset(Dataset):
                 else:
                     weights.append(1)
                 words.append(word)
+                static_mask.append(1 if ('NN' in tag or 'JJ' in tag) else 0)
+                motion_mask.append(1 if ('VB' in tag or 'RB' in tag) else 0)
 
         # Handle empty words list
         if len(words) == 0:
@@ -78,6 +82,8 @@ class BaseDataset(Dataset):
                     f"Empty vocabulary and empty words for sample {index}: {sentence}")
             words = [default_word]
             weights = [1]
+            static_mask = [0]
+            motion_mask = [0]
 
         words_id = [self.keep_vocab[w] for w in words]
         words_feat = [self.vocab['id2vec'][self.vocab['w2id'][words[0]]].astype(
@@ -92,6 +98,8 @@ class BaseDataset(Dataset):
             'words_feat': words_feat,
             'words_id': words_id,
             'weights': weights,
+            'static_mask': static_mask,
+            'motion_mask': motion_mask,
             'raw': [vid, duration, timestamps, sentence]
         }
 
@@ -116,6 +124,8 @@ def build_collate_data(max_num_frames, max_num_words, frame_dim, word_dim):
             [bsz, max(words_len) + 1, word_dim]).astype(np.float32)
         words_id = np.zeros([bsz, max(words_len)]).astype(np.int64)
         weights = np.zeros([bsz, max(words_len)]).astype(np.float32)
+        static_mask = np.zeros([bsz, max(words_len)]).astype(np.float32)
+        motion_mask = np.zeros([bsz, max(words_len)]).astype(np.float32)
         for i, sample in enumerate(samples):
             frames_feat[i, :len(sample['frames_feat'])] = sample['frames_feat']
             keep = min(len(sample['words_feat']), words_feat.shape[1])
@@ -125,6 +135,9 @@ def build_collate_data(max_num_frames, max_num_words, frame_dim, word_dim):
             keep = min(len(sample['weights']), weights.shape[1])
             tmp = np.exp(sample['weights'][:keep])
             weights[i, :keep] = tmp / np.sum(tmp)
+            keep_sm = min(len(sample['static_mask']), static_mask.shape[1])
+            static_mask[i, :keep_sm] = sample['static_mask'][:keep_sm]
+            motion_mask[i, :keep_sm] = sample['motion_mask'][:keep_sm]
 
         batch.update({
             'net_input': {
@@ -134,6 +147,8 @@ def build_collate_data(max_num_frames, max_num_words, frame_dim, word_dim):
                 'words_id': torch.from_numpy(words_id),
                 'weights': torch.from_numpy(weights),
                 'words_len': torch.from_numpy(np.asarray(words_len)),
+                'static_mask': torch.from_numpy(static_mask),
+                'motion_mask': torch.from_numpy(motion_mask),
             }
         })
         return batch
