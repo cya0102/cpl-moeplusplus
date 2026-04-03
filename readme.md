@@ -9,3 +9,7 @@ python train.py --config-path config/activitynet/main_moe.json --tag cpl_moe --l
 python train.py --config-path config/charades/main_dmvs.json --tag cpl_dmvs --log_dir logs/charades_dmvs
 
 python train.py --config-path config/activitynet/main_dmvs.json --tag cpl_dmvs --log_dir logs/activitynet_dmvs
+
+python train.py --config-path config/charades/main_fusion.json --tag cpl_fusion --log_dir logs/charades_fusion
+
+python train.py --config-path config/activitynet/main_fusion.json --tag cpl_fusion --log_dir logs/activitynet_fusion

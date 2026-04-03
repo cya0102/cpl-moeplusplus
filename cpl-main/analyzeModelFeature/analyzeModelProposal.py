@@ -53,6 +53,7 @@ def analyze_model_predictions(
     iou_thresholds=(0.3, 0.5, 0.7),
     epoch_for_inference=100,
     dataset_name="ActivityNet",
+    model_name="UnknownModel",
 ):
     """
     在验证/测试集上运行一次推理，记录每个样本的全部 num_props 提议与 GT 区间。
@@ -284,6 +285,8 @@ def analyze_model_predictions(
 
     result_package = {
         "meta": {
+            "model_name": model_name,
+            "dataset_name": dataset_name,
             "created_at": datetime.now().isoformat(),
             "split": split_name,
             "num_props": int(getattr(model, 'num_props', -1)),
@@ -395,16 +398,18 @@ def _resolve_path(raw, base_dir):
     return os.path.join(base_dir, raw)
 
 
+def _safe_name(name: str):
+    return ''.join(ch if (ch.isalnum() or ch in ('-', '_')) else '_' for ch in str(name))
+
+
 def main():
     args = parse_args()
 
-    # 相对路径自动补全：config/ checkpoints/ analyzeModelFeature/
+    # 相对路径自动补全：config/ checkpoints/
     args.config_path = _resolve_path(args.config_path,
                                      os.path.join(PROJECT_ROOT, 'config'))
     args.model_path = _resolve_path(args.model_path,
                                     os.path.join(PROJECT_ROOT, 'checkpoints'))
-    args.output_file = _resolve_path(args.output_file,
-                                     os.path.join(PROJECT_ROOT, 'analyzeModelFeature'))
 
     if not os.path.exists(args.config_path):
         raise FileNotFoundError(f'Config file not found: {args.config_path}')
@@ -412,12 +417,17 @@ def main():
         raise FileNotFoundError(
             f'Model checkpoint not found: {args.model_path}')
 
+    # 先读取配置，获取数据集名和模型名
+    config = load_json(args.config_path)
+    dataset_name = config['dataset'].get('dataset', 'ActivityNet')
+    model_name = config.get('model', {}).get('name', 'UnknownModel')
+
+    # 输出到当前工作目录，按“数据集_模型名”命名
+    args.output_file = f"{_safe_name(dataset_name)}_{_safe_name(model_name)}.json"
+
     runner = build_runner_from_args(args)
 
     # 根据数据集类型确定 IoU 阈值
-    config = load_json(args.config_path)
-    dataset_name = config['dataset'].get('dataset', 'ActivityNet')
-
     if dataset_name == 'CharadesSTA':
         iou_thresholds = (0.3, 0.5, 0.7)
     else:  # ActivityNet
@@ -437,6 +447,7 @@ def main():
         iou_thresholds=iou_thresholds,
         epoch_for_inference=args.epoch_for_inference,
         dataset_name=dataset_name,
+        model_name=model_name,
     )
 
 # 调用示例 (你需要根据你的实际启动脚本调整传入的变量):
@@ -448,5 +459,5 @@ if __name__ == '__main__':
     main()
 
 '''
-python analyzeModelProposal.py --config-path activitynet/main_moe.json --model-path activitynet_moe/cpl_moe/model-best.pt --output-file AncPropInfo.json
+python analyzeModelProposal.py --config-path activitynet/main_fusion.json --model-path activitynet_fusion/cpl_fusion/model-best.pt
 '''
