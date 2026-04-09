@@ -214,7 +214,8 @@ class ScaleAwareGatingNetwork(nn.Module):
     """
 
     def __init__(self, d_model, d_scale, num_experts,
-                 use_cross_attn=True, use_scale_prior=True, dropout=0.1):
+                 use_cross_attn=True, use_scale_prior=True, dropout=0.1,
+                 noise_init_std=0.5):
         super().__init__()
         self.d_model = d_model
         self.d_scale = d_scale
@@ -247,7 +248,8 @@ class ScaleAwareGatingNetwork(nn.Module):
         self.alpha = nn.Parameter(torch.tensor(0.0))
 
         # Training noise std (annealed from init_std → 0)
-        self.noise_std = nn.Parameter(torch.tensor(0.5), requires_grad=False)
+        self.noise_init_std = float(noise_init_std)
+        self.register_buffer('noise_std', torch.tensor(self.noise_init_std))
 
     def forward(self, v_global, q_global, query_feat, query_mask,
                 query_scale_feat, video_density_feat, scale_score, training):
@@ -312,13 +314,15 @@ class ScaleAwareGatingNetwork(nn.Module):
     def anneal_noise(self, current_step, total_anneal_steps):
         """Linearly anneal noise_std from initial value to 0."""
         ratio = min(current_step / max(total_anneal_steps, 1), 1.0)
-        init_std = 0.5  # matches __init__
-        self.noise_std.fill_(init_std * (1.0 - ratio))
+        new_std = self.noise_init_std * (1.0 - ratio)
+        with torch.no_grad():
+            self.noise_std.fill_(new_std)
 
     def warmup_alpha(self, current_step, warmup_steps, target_alpha=1.0):
         """Linearly warm up alpha from 0 to target_alpha."""
         ratio = min(current_step / max(warmup_steps, 1), 1.0)
-        self.alpha.fill_(target_alpha * ratio)
+        with torch.no_grad():
+            self.alpha.fill_(target_alpha * ratio)
 
 
 # ==============================================================================
@@ -563,6 +567,7 @@ class CPL_MoEv2(nn.Module):
             use_cross_attn=self.use_cross_attn_fusion,
             use_scale_prior=self.use_scale_prior_bias,
             dropout=config['dropout'],
+            noise_init_std=self.noise_init_std,
         )
         self.expert_pool = StratifiedExpertPool(
             self.hidden_size, self.num_experts, nhead=4, dropout=config['dropout'],
