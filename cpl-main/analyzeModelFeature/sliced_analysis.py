@@ -617,6 +617,31 @@ def format_metrics_table(
     iou_thresholds: List[float],
 ) -> str:
     """将切片分析结果格式化为可读表格"""
+    def _format_aligned_table(headers: List[str], rows: List[List[str]]) -> List[str]:
+        """生成对齐更工整的文本表格（首列左对齐，其余列右对齐）"""
+        if not rows:
+            widths = [len(h) for h in headers]
+        else:
+            widths = []
+            for ci, h in enumerate(headers):
+                max_cell_len = max(len(str(r[ci])) for r in rows)
+                widths.append(max(len(h), max_cell_len))
+
+        def _fmt_row(row: List[str], is_header: bool = False) -> str:
+            cells = []
+            for i, cell in enumerate(row):
+                text = str(cell)
+                if i == 0:
+                    cells.append(text.ljust(widths[i]))
+                else:
+                    cells.append(text.rjust(widths[i]))
+            return "  ".join(cells)
+
+        header_line = _fmt_row(headers, is_header=True)
+        sep_line = "-" * len(header_line)
+        content_lines = [_fmt_row(r) for r in rows]
+        return [header_line, sep_line] + content_lines
+
     lines = []
     dim_name = dim_result["dimension"]
     lines.append(f"\n{'='*80}")
@@ -625,26 +650,27 @@ def format_metrics_table(
 
     # 构建表头
     metric_keys = [f"R@1,IoU={thr}" for thr in iou_thresholds] + ["mIoU"]
-    header_parts = [f"{'切片':<25}", f"{'数量':>6}"]
+    headers = ["切片", "数量"]
     for model_name in model_names:
         short_name = model_name.replace("CPL_", "")
         for mk in metric_keys:
             short_mk = mk.replace("R@1,", "").replace("IoU=", "")
-            header_parts.append(f"{short_name}_{short_mk:>10}")
-    lines.append("  ".join(header_parts))
-    lines.append("-" * len("  ".join(header_parts)))
+            headers.append(f"{short_name}_{short_mk}")
 
+    table_rows = []
     for slice_name, slice_data in sorted(
         dim_result["slices"].items(),
         key=lambda x: x[1]["count"],
         reverse=True,
     ):
-        row_parts = [f"{slice_name:<25}", f"{slice_data['count']:>6}"]
+        row_parts = [str(slice_name), str(slice_data["count"])]
         for model_name in model_names:
             model_metrics = slice_data["models"][model_name]
             for mk in metric_keys:
-                row_parts.append(f"{model_metrics.get(mk, 0)*100:>10.1f}")
-        lines.append("  ".join(row_parts))
+                row_parts.append(f"{model_metrics.get(mk, 0) * 100:.1f}")
+        table_rows.append(row_parts)
+
+    lines.extend(_format_aligned_table(headers, table_rows))
 
     return "\n".join(lines)
 
@@ -815,6 +841,74 @@ def write_analysis_csv(analysis_bundle: Dict[str, Any], output_csv_path: str):
     print(f"CSV 数据已保存到: {output_csv_path}")
 
 
+def write_report_json(
+    analyzer: SlicedAnalyzer,
+    all_dim_results: Dict[str, Dict],
+    divergences: List[Dict],
+    strengths: Dict[str, Dict],
+    global_metrics: Dict[str, Dict[str, float]],
+    output_json_path: str,
+):
+    """
+    输出“报告版 JSON”：更偏向阅读和下游报表系统使用。
+    说明：不同于 analysis_data.json（偏完整原始结构），该文件附带百分制摘要。
+    """
+    global_metrics_percent = {}
+    for model_name, metrics in global_metrics.items():
+        global_metrics_percent[model_name] = {}
+        for k, v in metrics.items():
+            if k == "count":
+                global_metrics_percent[model_name][k] = v
+            else:
+                global_metrics_percent[model_name][k] = round(v * 100, 4)
+
+    dimension_summary = {}
+    for dim_name, dim_result in all_dim_results.items():
+        slices_summary = []
+        for slice_name, slice_data in sorted(
+            dim_result["slices"].items(),
+            key=lambda x: x[1]["count"],
+            reverse=True,
+        ):
+            model_metrics_percent = {}
+            for model_name in analyzer.model_names:
+                model_metrics_percent[model_name] = {}
+                for mk, mv in slice_data["models"][model_name].items():
+                    if mk == "count":
+                        model_metrics_percent[model_name][mk] = mv
+                    else:
+                        model_metrics_percent[model_name][mk] = round(mv * 100, 4)
+
+            slices_summary.append({
+                "slice": slice_name,
+                "count": slice_data["count"],
+                "ratio": round(slice_data.get("ratio", 0.0), 6),
+                "models_percent": model_metrics_percent,
+            })
+
+        dimension_summary[dim_name] = {
+            "dimension": dim_name,
+            "num_slices": dim_result["num_slices"],
+            "slices": slices_summary,
+        }
+
+    report_json = {
+        "dataset": analyzer.dataset,
+        "model_names": analyzer.model_names,
+        "num_samples": len(analyzer.samples),
+        "iou_thresholds": analyzer.iou_thresholds,
+        "global_metrics_percent": global_metrics_percent,
+        "dimension_summary": dimension_summary,
+        "divergences": divergences,
+        "strengths": strengths,
+    }
+
+    with open(output_json_path, "w", encoding="utf-8") as f:
+        json.dump(report_json, f, ensure_ascii=False, indent=2)
+
+    print(f"报告 JSON 已保存到: {output_json_path}")
+
+
 def generate_full_report(analyzer: SlicedAnalyzer, output_dir: str):
     """生成完整分析报告"""
     os.makedirs(output_dir, exist_ok=True)
@@ -911,6 +1005,17 @@ def generate_full_report(analyzer: SlicedAnalyzer, output_dir: str):
     # 保存 CSV（同一文件汇总全部分析内容）
     csv_path = os.path.join(output_dir, f"{prefix}_analysis_report.csv")
     write_analysis_csv(json_result, csv_path)
+
+    # 保存报告版 JSON（可读、百分制）
+    report_json_path = os.path.join(output_dir, f"{prefix}_analysis_report.json")
+    write_report_json(
+        analyzer=analyzer,
+        all_dim_results=all_dim_results,
+        divergences=divergences,
+        strengths=strengths,
+        global_metrics=global_metrics,
+        output_json_path=report_json_path,
+    )
 
     # 输出关键发现到终端
     print("\n" + report_text)
