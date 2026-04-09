@@ -3,7 +3,7 @@
 
 用法:
     python visualize_sliced.py \
-        --input sliced_results/charades/analysis_data.json \
+        --input sliced_results/charades/charades_analysis_data.json \
         --output-dir sliced_results/charades/figures
 
     # 也可以直接从预测文件运行（会先调用分析再可视化）:
@@ -37,6 +37,29 @@ COLORS = [
 
 
 def load_analysis_data(path: str) -> Dict:
+    # 允许传入目录：自动查找 *_analysis_data.json
+    if os.path.isdir(path):
+        candidates = [
+            os.path.join(path, fn)
+            for fn in os.listdir(path)
+            if fn.endswith("_analysis_data.json")
+        ]
+        if len(candidates) == 1:
+            path = candidates[0]
+        elif len(candidates) > 1:
+            # 默认选择按文件名排序后的第一个，避免歧义时报错
+            candidates.sort()
+            path = candidates[0]
+            print(f"检测到多个 *_analysis_data.json，默认使用: {path}")
+        else:
+            # 向后兼容旧文件名
+            fallback = os.path.join(path, "analysis_data.json")
+            if os.path.exists(fallback):
+                path = fallback
+            else:
+                raise FileNotFoundError(
+                    f"目录中未找到 *_analysis_data.json: {path}")
+
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -440,7 +463,8 @@ def generate_all_figures(analysis_data: Dict, output_dir: str):
 def parse_args():
     parser = argparse.ArgumentParser(description="生成切片分析的可视化图表")
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--input", type=str, help="分析结果 JSON (analysis_data.json)")
+    group.add_argument("--input", type=str,
+                       help="分析结果 JSON（推荐 *_analysis_data.json，也支持传目录自动查找）")
     group.add_argument("--dataset", type=str, choices=["charades", "activitynet"],
                        help="数据集（需同时提供 --pred-files）")
     parser.add_argument("--pred-files", type=str, nargs="+",

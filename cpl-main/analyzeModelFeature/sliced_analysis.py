@@ -5,12 +5,12 @@
 用法:
     python sliced_analysis.py \
         --dataset charades \
-        --pred-files CharadesSTA_CPL_Fusion.json CharadesSTA_CPL_DMVS.json \
+        --pred-files CharadesSTA_CPL.json CharadesSTA_CPL_MoE.json CharadesSTA_CPL_DMVS.json \
         --output-dir sliced_results/charades
 
     python sliced_analysis.py \
         --dataset activitynet \
-        --pred-files ActivityNet_CPL_Fusion.json ActivityNet_CPL_DMVS.json \
+        --pred-files ActivityNet_CPL.json ActivityNet_CPL_MoE.json ActivityNet_CPL_DMVS.json \
         --output-dir sliced_results/activitynet
 """
 
@@ -18,6 +18,7 @@ import os
 import sys
 import json
 import re
+import csv
 import argparse
 from collections import defaultdict
 from typing import Dict, List, Tuple, Any, Optional
@@ -696,6 +697,124 @@ def format_strength_report(strengths: Dict[str, Dict]) -> str:
     return "\n".join(lines)
 
 
+def write_analysis_csv(analysis_bundle: Dict[str, Any], output_csv_path: str):
+    """
+    将分析结果汇总写入同一个 CSV 文件。
+    CSV 采用长表格式，便于后续筛选/透视分析。
+    """
+    fieldnames = [
+        "section",
+        "dataset",
+        "dimension",
+        "slice",
+        "count",
+        "ratio",
+        "model",
+        "metric",
+        "value",
+        "extra",
+    ]
+
+    dataset = analysis_bundle["dataset"]
+    model_names = analysis_bundle["model_names"]
+    iou_thresholds = analysis_bundle["iou_thresholds"]
+    dim_results = analysis_bundle["dimension_results"]
+    divergences = analysis_bundle.get("divergences", [])
+    strengths = analysis_bundle.get("strengths", {})
+    global_metrics = analysis_bundle.get("global_metrics", {})
+
+    rows = []
+
+    # 1) 全局指标
+    for model_name in model_names:
+        metrics = global_metrics.get(model_name, {})
+        for mk, mv in metrics.items():
+            if mk == "count":
+                continue
+            rows.append({
+                "section": "global_metrics",
+                "dataset": dataset,
+                "dimension": "",
+                "slice": "",
+                "count": metrics.get("count", 0),
+                "ratio": "",
+                "model": model_name,
+                "metric": mk,
+                "value": mv,
+                "extra": "",
+            })
+
+    # 2) 各维度切片指标
+    metric_keys = [f"R@1,IoU={thr}" for thr in iou_thresholds] + [
+        "mIoU",
+        "R@5,mIoU",
+    ] + [f"R@5,IoU={thr}" for thr in iou_thresholds]
+
+    for dim_name, dim_result in dim_results.items():
+        for slice_name, slice_data in dim_result["slices"].items():
+            for model_name in model_names:
+                model_metrics = slice_data["models"].get(model_name, {})
+                for mk in metric_keys:
+                    if mk not in model_metrics:
+                        continue
+                    rows.append({
+                        "section": "slice_metrics",
+                        "dataset": dataset,
+                        "dimension": dim_name,
+                        "slice": slice_name,
+                        "count": slice_data.get("count", 0),
+                        "ratio": slice_data.get("ratio", ""),
+                        "model": model_name,
+                        "metric": mk,
+                        "value": model_metrics.get(mk, 0.0),
+                        "extra": "",
+                    })
+
+    # 3) 差异切片
+    for d in divergences:
+        for model_name, model_val in d.get("model_values", {}).items():
+            rows.append({
+                "section": "divergence",
+                "dataset": dataset,
+                "dimension": d.get("dimension", ""),
+                "slice": d.get("slice", ""),
+                "count": d.get("count", 0),
+                "ratio": "",
+                "model": model_name,
+                "metric": d.get("metric", ""),
+                "value": model_val,
+                "extra": f"max_diff={d.get('max_diff', 0.0)};best={d.get('best_model', '')};worst={d.get('worst_model', '')}",
+            })
+
+    # 4) 模型优劣势
+    for model_name, model_strength in strengths.items():
+        for section_key in ["best_slices", "worst_slices"]:
+            section_name = f"strength_{section_key}"
+            for entry in model_strength.get(section_key, []):
+                metric_keys_in_entry = [k for k in entry.keys() if k.startswith("R@1")]
+                metric_key = metric_keys_in_entry[0] if metric_keys_in_entry else ""
+                metric_val = entry.get(metric_key, 0.0) if metric_key else ""
+                rows.append({
+                    "section": section_name,
+                    "dataset": dataset,
+                    "dimension": entry.get("dimension", ""),
+                    "slice": entry.get("slice", ""),
+                    "count": entry.get("count", 0),
+                    "ratio": "",
+                    "model": model_name,
+                    "metric": metric_key,
+                    "value": metric_val,
+                    "extra": "",
+                })
+
+    with open(output_csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"CSV 数据已保存到: {output_csv_path}")
+
+
 def generate_full_report(analyzer: SlicedAnalyzer, output_dir: str):
     """生成完整分析报告"""
     os.makedirs(output_dir, exist_ok=True)
@@ -710,12 +829,14 @@ def generate_full_report(analyzer: SlicedAnalyzer, output_dir: str):
     report_lines.append(f"IoU 阈值: {analyzer.iou_thresholds}")
 
     # 先输出全局指标
+    global_metrics = {}
     report_lines.append(f"\n{'='*80}")
     report_lines.append("  全局指标")
     report_lines.append(f"{'='*80}")
     for model_name in analyzer.model_names:
         top1_ious = [s["model_top1_ious"][model_name] for s in analyzer.samples]
         metrics = compute_metrics(top1_ious, analyzer.iou_thresholds)
+        global_metrics[model_name] = metrics
         report_lines.append(f"\n  {model_name}:")
         for k, v in metrics.items():
             if k == "count":
@@ -762,7 +883,8 @@ def generate_full_report(analyzer: SlicedAnalyzer, output_dir: str):
 
     # 写出报告
     report_text = "\n".join(report_lines)
-    report_path = os.path.join(output_dir, "analysis_report.txt")
+    prefix = analyzer.dataset
+    report_path = os.path.join(output_dir, f"{prefix}_analysis_report.txt")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report_text)
     print(f"报告已保存到: {report_path}")
@@ -773,6 +895,7 @@ def generate_full_report(analyzer: SlicedAnalyzer, output_dir: str):
         "model_names": analyzer.model_names,
         "num_samples": len(analyzer.samples),
         "iou_thresholds": analyzer.iou_thresholds,
+        "global_metrics": global_metrics,
         "dimension_results": {},
         "divergences": divergences[:30],
         "strengths": strengths,
@@ -780,10 +903,14 @@ def generate_full_report(analyzer: SlicedAnalyzer, output_dir: str):
     for dim, dim_result in all_dim_results.items():
         json_result["dimension_results"][dim] = dim_result
 
-    json_path = os.path.join(output_dir, "analysis_data.json")
+    json_path = os.path.join(output_dir, f"{prefix}_analysis_data.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(json_result, f, ensure_ascii=False, indent=2)
     print(f"JSON 数据已保存到: {json_path}")
+
+    # 保存 CSV（同一文件汇总全部分析内容）
+    csv_path = os.path.join(output_dir, f"{prefix}_analysis_report.csv")
+    write_analysis_csv(json_result, csv_path)
 
     # 输出关键发现到终端
     print("\n" + report_text)

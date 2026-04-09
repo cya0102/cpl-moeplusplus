@@ -459,5 +459,12 @@ if __name__ == '__main__':
     main()
 
 '''
-python analyzeModelProposal.py --config-path activitynet/main_fusion.json --model-path activitynet_fusion/cpl_fusion/model-best.pt
+python analyzeModelProposal.py --config-path activitynet/main_moe.json --model-path activitynet_moe/cpl_moe/model-best.pt
+
+python analyzeModelProposal.py --config-path charades/main_moe.json --model-path charades_moe/cpl_moe/model-best.pt
+
+test baseline model
+python analyzeModelProposal.py --config-path activitynet/main.json --model-path activitynet/model-best.pt
+
+python analyzeModelProposal.py --config-path charades/main.json --model-path charades/model-best.pt
 '''
