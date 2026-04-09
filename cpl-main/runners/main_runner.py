@@ -33,7 +33,20 @@ class MainRunner:
 
     def train(self):
         best_results = None
+
+        # MoEv2 two-stage training support
+        moev2_warmup = self.args['train'].get('moev2_warmup_epochs', 0)
+        has_moev2 = hasattr(self.model, 'set_training_stage')
+        if has_moev2:
+            self.model.set_training_stage(1)
+            info('[MoEv2] Starting Stage 1 (warmup): gating frozen for {} epochs'.format(moev2_warmup))
+
         for epoch in range(1, self.args['train']['max_num_epochs']+1):
+            # Switch to Stage 2 when warmup ends
+            if has_moev2 and epoch == moev2_warmup + 1:
+                self.model.set_training_stage(2)
+                info('[MoEv2] Switching to Stage 2: gating unfrozen')
+
             info('Start Epoch {}'.format(epoch))
             self.model_saved_path = self.args['train']['model_saved_path']
             os.makedirs(self.model_saved_path, mode=0o755, exist_ok=True)
@@ -82,12 +95,29 @@ class MainRunner:
                 loss = loss + output['aux_loss']
                 loss_dict['aux_loss'] = output['aux_loss'].item()
 
+            # MoEv2 monitoring metrics
+            if 'scale_score' in output and output['scale_score'] is not None:
+                loss_dict['scale_score'] = output['scale_score'].mean().item()
+            if 'macro_load' in output and output['macro_load'] is not None:
+                loss_dict['macro_load'] = output['macro_load']
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10)
             self.optimizer.step()
 
             self.num_updates += 1
             curr_lr = self.lr_scheduler.step_update(self.num_updates)
+
+            # MoEv2: per-step noise annealing and alpha warmup
+            if hasattr(self.model, 'anneal_noise'):
+                noise_epochs = self.args['train'].get('moev2_noise_anneal_epochs', 15)
+                total_noise_steps = noise_epochs * len(self.train_loader)
+                self.model.anneal_noise(self.num_updates, total_noise_steps)
+            if hasattr(self.model, 'warmup_alpha') and not getattr(self.model, 'gating_frozen', True):
+                alpha_epochs = self.args['train'].get('moev2_alpha_warmup_epochs', 10)
+                total_alpha_steps = alpha_epochs * len(self.train_loader)
+                warmup_start = self.args['train'].get('moev2_warmup_epochs', 0) * len(self.train_loader)
+                self.model.warmup_alpha(self.num_updates - warmup_start, total_alpha_steps)
             time_meter.update()
             for k, v in loss_dict.items():
                 loss_meter[k].update(v)
