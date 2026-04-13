@@ -5,12 +5,12 @@
 用法:
     python sliced_analysis.py \
         --dataset charades \
-        --pred-files CharadesSTA_CPL.json CharadesSTA_CPL_MoE.json CharadesSTA_CPL_DMVS.json \
+        --pred-files CharadesSTA_CPL.json CharadesSTA_CPL_MoE.json \
         --output-dir sliced_results/charades
 
     python sliced_analysis.py \
         --dataset activitynet \
-        --pred-files ActivityNet_CPL.json ActivityNet_CPL_MoE.json ActivityNet_CPL_DMVS.json \
+        --pred-files ActivityNet_CPL.json ActivityNet_CPL_MoE.json \
         --output-dir sliced_results/activitynet
 """
 
