@@ -44,6 +44,37 @@ def _iou_1d(gt_start, gt_end, pred_start, pred_end):
     return inter_len / union_len if union_len > 0 else 0.0
 
 
+def _window_norm_to_frame_range(t_start_norm, t_end_norm, actual_T):
+    """将归一化 [0,1] 时间范围转换为整数帧索引区间 [si, ei)。"""
+    si = int(t_start_norm * actual_T)
+    ei = int(t_end_norm * actual_T)
+    ei = max(si + 1, ei)          # 保证至少包含 1 帧
+    si = min(si, actual_T - 1)
+    ei = min(ei, actual_T)
+    return si, ei
+
+
+def _compute_window_internal_sim(raw_frames, start_idx, end_idx):
+    """
+    计算窗口 [start_idx, end_idx) 内所有帧特征之间的平均成对余弦相似度。
+    raw_frames : [actual_T, d]  CUDA/CPU float tensor（原始帧特征，未经投影）
+    返回值     : float，窗口内帧特征的平均相似度；窗口仅含 1 帧时返回 1.0
+    """
+    start_idx = max(0, int(start_idx))
+    end_idx   = min(int(raw_frames.shape[0]), int(end_idx))
+    if end_idx <= start_idx:
+        return 0.0
+    win = raw_frames[start_idx:end_idx].float()   # [n, d]
+    n = win.shape[0]
+    if n == 1:
+        return 1.0
+    normed   = F.normalize(win, dim=-1)           # [n, d]
+    sim_mat  = normed @ normed.T                  # [n, n]
+    # 取上三角（排除对角线），即所有不重复的帧对
+    mask = torch.triu(torch.ones(n, n, dtype=torch.bool, device=win.device), diagonal=1)
+    return float(sim_mat[mask].mean().item())
+
+
 def analyze_model_predictions(
     model,
     dataloader,
@@ -145,7 +176,10 @@ def analyze_model_predictions(
                 gt_start, gt_end = float(gt_window_i[0]), float(gt_window_i[1])
                 gt_len = gt_end - gt_start
 
-                # 计算标准化交叉熵损失：nll_loss * width（标准化长度）
+                # 帧索引辅助变量（frames_feat 未被模型内部改变）
+                actual_T_i = int(frames_len[i].item())
+                raw_frames_i = frames_feat[i, :actual_T_i]  # [actual_T_i, frame_dim]
+
                 normalized_nll_loss = nll_losses_i * widths_i
                 
                 # 全部 num_props 提议（按标准化 nll_loss 从小到大排序）
@@ -170,6 +204,12 @@ def analyze_model_predictions(
                     pred_length = pred_end - pred_start
                     pred_length_norm = pred_length / duration if duration > 0 else 0.0
 
+                    # 候选片段内帧特征内部相似度
+                    _ps_norm = max(0.0, c_norm - w_norm / 2)
+                    _pe_norm = min(1.0, c_norm + w_norm / 2)
+                    _si, _ei = _window_norm_to_frame_range(_ps_norm, _pe_norm, actual_T_i)
+                    frame_internal_sim = _compute_window_internal_sim(raw_frames_i, _si, _ei)
+
                     sample_props.append({
                         "proposal_index": idx,
                         "rank": rank + 1,
@@ -180,12 +220,35 @@ def analyze_model_predictions(
                         "pred_window": [pred_start, pred_end],
                         "pred_length": pred_length,
                         "pred_length_norm": pred_length_norm,
-                        "iou": iou
+                        "iou": iou,
+                        "frame_internal_sim": frame_internal_sim,
                     })
 
                     # 记录Rank 1~8的标准化长度
                     if rank + 1 <= 8:
                         rank_norm_lengths[rank + 1].append(pred_length_norm)
+
+                # ---- 视频帧特征相似度分析 ----
+                # 1. GT 窗口内帧内部相似度
+                _gt_dur = duration if duration > 0 else 1.0
+                _gt_si, _gt_ei = _window_norm_to_frame_range(
+                    gt_start / _gt_dur, gt_end / _gt_dur, actual_T_i
+                )
+                gt_internal_sim = _compute_window_internal_sim(raw_frames_i, _gt_si, _gt_ei)
+
+                # 2. 各候选片段均値特征 → 片段间相似度矩阵
+                _prop_mean_feats = []
+                for _prop in sample_props:
+                    _ps = max(0.0, _prop['center_norm'] - _prop['width_norm'] / 2)
+                    _pe = min(1.0, _prop['center_norm'] + _prop['width_norm'] / 2)
+                    _si2, _ei2 = _window_norm_to_frame_range(_ps, _pe, actual_T_i)
+                    _win = raw_frames_i[_si2:_ei2].float()
+                    if _win.shape[0] == 0:
+                        _win = raw_frames_i[:1].float()
+                    _prop_mean_feats.append(_win.mean(dim=0))
+                _feat_stack = torch.stack(_prop_mean_feats, dim=0)  # [num_props, d]
+                _normed_stack = F.normalize(_feat_stack, dim=-1)
+                between_sim_mat = (_normed_stack @ _normed_stack.T).cpu().tolist()
 
                 top1 = sample_props[0]
                 top5 = sample_props[:5]
@@ -247,6 +310,8 @@ def analyze_model_predictions(
                         sample_props[1]['nll_loss']
                         if len(sample_props) > 1 else None
                     ),
+                    "gt_frame_internal_sim": gt_internal_sim,
+                    "between_proposal_sim_matrix": between_sim_mat,
                     "proposals": sample_props,
                 })
 
