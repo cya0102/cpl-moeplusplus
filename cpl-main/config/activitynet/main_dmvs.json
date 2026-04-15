@@ -47,7 +47,7 @@
   "loss": {
     "margin_1": 0.1,
     "margin_2": 0.15,
-    "lambda": 0.13,
+    "lambda": 0.127,
     "alpha_1": 2,
     "alpha_2": 0.1
   }

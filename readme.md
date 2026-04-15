@@ -13,3 +13,10 @@ python train.py --config-path config/activitynet/main_dmvs.json --tag cpl_dmvs -
 python train.py --config-path config/charades/main_fusion.json --tag cpl_fusion --log_dir logs/charades_fusion
 
 python train.py --config-path config/activitynet/main_fusion.json --tag cpl_fusion --log_dir logs/activitynet_fusion
+
+
+# baseline
+
+python train.py --config-path config/activitynet/main.json --log_dir logs/glove/activitynet/baseline --tag baseline
+
+python train.py --config-path config/charades/main.json --log_dir logs/glove/charades/baseline --tag baseline

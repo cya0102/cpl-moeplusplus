@@ -9,7 +9,7 @@ import nltk
 from transformers import BertTokenizer, BertModel
 
 # 确保已经下载了必要的 nltk 数据
-# nltk.download('punkt')
+nltk.download('punkt')
 
 def generate_bert_vocab(dataset_name, json_files, output_pkl):
     print(f"\n[Processing {dataset_name}]")
