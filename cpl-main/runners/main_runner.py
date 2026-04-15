@@ -231,9 +231,13 @@ class MainRunner:
 
     def _build_model(self):
         model_config = self.args['model']
-        import models
+        model_source = model_config.get('source', 'models')
+        if model_source == 'baseline':
+            import baseline as model_module
+        else:
+            import models as model_module
 
-        self.model = getattr(models, model_config['name'], None)(model_config['config'])
+        self.model = getattr(model_module, model_config['name'], None)(model_config['config'])
         self.model = self.model.cuda()
         print(self.model)
         total_num = sum(p.numel() for p in self.model.parameters())
